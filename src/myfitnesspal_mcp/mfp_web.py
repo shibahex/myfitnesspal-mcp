@@ -55,6 +55,23 @@ def require_status(resp, endpoint: str, accepted: tuple[int, ...]) -> None:
         raise RuntimeError(f"MyFitnessPal {endpoint} returned HTTP {resp.status_code}")
 
 
+def legacy_form_headers(referer: str) -> dict[str, str]:
+    return {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": ORIGIN,
+        "Referer": referer,
+    }
+
+
+def form_token(doc, action: str) -> str:
+    tokens = doc.xpath(
+        f"//form[@action='{action}']//input[@name='authenticity_token']/@value"
+    )
+    if not tokens:
+        raise RuntimeError(f"couldn't read the MyFitnessPal {action} form token")
+    return tokens[0]
+
+
 def get_document(client, url: str) -> lh.HtmlElement:
     resp = client.session.get(url, headers=api_headers(client))
     resp.raise_for_status()
@@ -83,10 +100,6 @@ def post_legacy_delete(
     resp = client.session.post(
         site_url(client, f"{path}/{entry_id}"),
         data={"_method": "delete", "authenticity_token": token},
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": ORIGIN,
-            "Referer": referer,
-        },
+        headers=legacy_form_headers(referer),
     )
     require_status(resp, f"/{path}", (200, 204))

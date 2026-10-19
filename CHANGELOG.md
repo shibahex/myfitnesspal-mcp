@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `fitness_create_food` creates a private custom food, and `fitness_save_meal`
+  saves what's logged in a diary meal as a named saved meal.
+  `fitness_list_my_foods` lists both, and `fitness_log_my_food` logs either one
+  by name or id. Custom foods log through MFP's v2 diary API, because
+  `/food/add` rejects their ids. Saved meals log through `/food/add` with the
+  meal's "1 meal" serving.
+
 ### Fixed
 
 - `auth` no longer fails to seed the auto-refresh browser profile when the

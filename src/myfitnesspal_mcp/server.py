@@ -10,8 +10,10 @@ from . import (
     exercise,
     food_logging,
     food_search,
+    goals,
     measurements,
     mfp_client,
+    my_foods,
     notes,
     refresh,
     sync,
@@ -362,6 +364,159 @@ async def fitness_modify_food(
 
 
 @mcp.tool()
+async def fitness_create_food(
+    name: str,
+    calories: float,
+    protein: float | None = None,
+    carbohydrates: float | None = None,
+    fat: float | None = None,
+    serving_value: float = 1.0,
+    serving_unit: str = "serving",
+    brand: str | None = None,
+    saturated_fat: float | None = None,
+    sodium: float | None = None,
+    fiber: float | None = None,
+    sugar: float | None = None,
+    cholesterol: float | None = None,
+    potassium: float | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Create a private custom food in MyFitnessPal (it shows under My Foods).
+
+    Use it for a combination eaten often (e.g. "soup + canned chicken" with the
+    summed totals) or a food the database lacks. Nutrition is per one serving
+    of serving_value x serving_unit (e.g. 1 x "meal", 150 x "g"). Units:
+    calories in kcal; protein/carbohydrates/fat/saturated_fat/fiber/sugar in
+    g; sodium/cholesterol/potassium in mg. Every call creates a new food, so
+    check fitness_list_my_foods first. Log it with fitness_log_my_food, not
+    fitness_log_food (custom foods aren't in the public search).
+    """
+    nutrients = {
+        key: value
+        for key, value in {
+            "protein": protein,
+            "carbohydrates": carbohydrates,
+            "fat": fat,
+            "saturated_fat": saturated_fat,
+            "sodium": sodium,
+            "fiber": fiber,
+            "sugar": sugar,
+            "cholesterol": cholesterol,
+            "potassium": potassium,
+        }.items()
+        if value is not None
+    }
+
+    def op(store, client):
+        return my_foods.create_food(
+            client,
+            name,
+            calories,
+            nutrients=nutrients,
+            serving_value=serving_value,
+            serving_unit=serving_unit,
+            brand=brand or "",
+        )
+
+    return {"ok": True, "created": await with_session(ctx, op)}
+
+
+@mcp.tool()
+async def fitness_save_meal(
+    name: str,
+    meal: str = food_logging.DEFAULT_MEAL,
+    date: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Save what's logged in one diary meal as a named MyFitnessPal saved meal
+    (My Meals), like the diary's "Remember Meal" button.
+
+    Log the foods first (fitness_log_food), then save, e.g. meal="dinner",
+    name="Soup + canned chicken". The saved meal keeps each food and its
+    quantity; log it again later with fitness_log_my_food. Every call saves a
+    new meal, so check fitness_list_my_foods first.
+    meal: breakfast|lunch|dinner|snacks or any meal name on the account.
+    date: YYYY-MM-DD of the diary day to copy from (default: today).
+    """
+    day = parse_day(date)
+
+    def op(store, client):
+        return my_foods.save_meal(client, day, meal, name)
+
+    return {"ok": True, **await with_session(ctx, op)}
+
+
+@mcp.tool()
+async def fitness_list_my_foods(search: str = "", ctx: Context = None) -> dict:
+    """List your MyFitnessPal custom foods (kind "food") and saved meals
+    (kind "meal"), optionally filtered by name.
+
+    Each has a food_id to pass to fitness_log_my_food, its calories and
+    macros (per serving for foods, the total for meals), and for foods the
+    serving sizes by index.
+    """
+
+    def op(store, client):
+        return my_foods.find_mine(client, search)
+
+    return {"ok": True, "search": search, "results": await with_session(ctx, op)}
+
+
+@mcp.tool()
+async def fitness_log_my_food(
+    query: str | None = None,
+    food_id: str | None = None,
+    meal: str | None = None,
+    quantity: float | None = None,
+    serving: int | None = None,
+    date: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Log one of your own custom foods or saved meals to the diary.
+
+    query: matched against your custom foods and saved meals by name. It logs
+    when one name matches exactly or there's only one match; otherwise nothing
+    is logged and the candidates come back (needs_choice=true) — call again
+    with food_id. food_id: from fitness_list_my_foods or those candidates.
+    Logging a saved meal adds each of its foods as separate diary entries.
+    meal: breakfast|lunch|dinner|snacks (default breakfast) or any meal name
+    on the account. quantity: number of servings (default 1). serving: a
+    custom food's serving-size index (default 0); saved meals have only one.
+    date: YYYY-MM-DD (default today).
+    """
+    day = parse_day(date)
+    chosen_meal = meal or food_logging.DEFAULT_MEAL
+
+    def op(store, client):
+        food, candidates = my_foods.resolve_mine(client, query, food_id)
+        if food is None:
+            return {
+                "logged": None,
+                "needs_choice": True,
+                "query": query,
+                "candidates": candidates,
+            }
+        return my_foods.log_mine(
+            client,
+            day,
+            chosen_meal,
+            food,
+            quantity=1.0 if quantity is None else quantity,
+            serving=serving,
+        )
+
+    result = await with_session(ctx, op)
+    if not result.get("logged"):
+        return {"ok": True, **result}
+    return {
+        "ok": True,
+        **result,
+        **await refresh_after_write(ctx, day),
+        "day": get_store().day_record(day.isoformat()),
+    }
+
+
+@mcp.tool()
 async def fitness_log_weight(
     weight: float, date: str | None = None, ctx: Context = None
 ) -> dict:
@@ -410,6 +565,67 @@ async def fitness_log_water(
 
 
 @mcp.tool()
+async def fitness_get_goals(date: str | None = None, ctx: Context = None) -> dict:
+    """Read the MyFitnessPal nutrition goals in effect on a day.
+
+    Returns calories plus every nutrient goal (grams; cholesterol, sodium and
+    potassium in mg; vitamins and minerals in %DV).
+    date: YYYY-MM-DD (default: today).
+    """
+    day = parse_day(date)
+
+    def op(store, client):
+        return goals.get_goals(client, day)
+
+    return await with_session(ctx, op)
+
+
+@mcp.tool()
+async def fitness_set_goals(
+    calories: float | None = None,
+    protein: float | None = None,
+    carbohydrates: float | None = None,
+    fat: float | None = None,
+    saturated_fat: float | None = None,
+    cholesterol: float | None = None,
+    sodium: float | None = None,
+    fiber: float | None = None,
+    sugar: float | None = None,
+    potassium: float | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Change MyFitnessPal nutrition goals from today onward.
+
+    Pass only the goals to change; everything else keeps its current value.
+    Units: calories in kcal; protein/carbohydrates/fat/saturated_fat/fiber/
+    sugar in g; cholesterol/sodium/potassium in mg. Applies to every weekday.
+    Returns the previous values of what changed, to undo a mistake.
+    """
+    changes = {
+        key: value
+        for key, value in {
+            "calories": calories,
+            "protein": protein,
+            "carbohydrates": carbohydrates,
+            "fat": fat,
+            "saturated_fat": saturated_fat,
+            "cholesterol": cholesterol,
+            "sodium": sodium,
+            "fiber": fiber,
+            "sugar": sugar,
+            "potassium": potassium,
+        }.items()
+        if value is not None
+    }
+    today = datetime.date.today()
+
+    def op(store, client):
+        return goals.set_goals(client, today, changes)
+
+    return await with_session(ctx, op)
+
+
+@mcp.tool()
 async def fitness_get_exercise(date: str | None = None, ctx: Context = None) -> dict:
     """Read the MyFitnessPal exercise diary (cardio + strength) for a day.
 
@@ -439,6 +655,41 @@ async def fitness_get_exercise_entries(
     def op(store, client):
         doc, _ = exercise.exercise_page(client, day)
         return {"day": day.isoformat(), "entries": exercise.exercise_entries(doc)}
+
+    return await with_session(ctx, op)
+
+
+@mcp.tool()
+async def fitness_log_exercise(
+    minutes: float,
+    query: str | None = None,
+    exercise_id: str | None = None,
+    calories: int | None = None,
+    date: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Log a cardio exercise (e.g. walking) to the MyFitnessPal exercise diary.
+
+    query: searched in MFP's cardio database, e.g. "walking, 12.5 mins per km".
+    It logs when one result's name matches exactly or there is only one
+    result; otherwise nothing is logged and the candidates come back
+    (needs_choice=true) — call again with exercise_id. minutes: duration.
+    calories: burned; omit to let MFP's formula (METs x hours x your current
+    weight) compute it, as the web form does. Steps aren't a web-diary
+    concept: log them as walking minutes (~100-110 steps per minute at a
+    moderate pace). date: YYYY-MM-DD (default: today).
+    """
+    day = parse_day(date)
+
+    def op(store, client):
+        return exercise.log_cardio(
+            client,
+            day,
+            minutes,
+            query=query,
+            exercise_id=exercise_id,
+            calories=calories,
+        )
 
     return await with_session(ctx, op)
 

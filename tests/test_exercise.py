@@ -147,3 +147,70 @@ def test_identical_exercise_rows_resolve_to_one():
 def test_delete_exercise_is_case_insensitive(exercise_client):
     result = exercise.delete_exercise(exercise_client, TODAY, "PULL UP")
     assert result["removed"][0]["entry_id"] == "555"
+
+
+ADD_PAGE = """<html><head><meta name="csrf-token" content="PAGETOKEN"></head><body>
+<form action="/exercise/search"><input name="authenticity_token" value="SEARCHTOKEN"/></form>
+<input type="hidden" id="current_weight" value="100.0">
+</body></html>"""
+
+SEARCH_RESULTS = """<html><body><ul id="matching">
+<li><a class="search" href="/exercise/update_exercise/196?date=2026-09-10">Walking, 10.5 mins per km, brisk pace</a></li>
+<li><a class="search" href="/exercise/update_exercise/26688321?date=2026-09-10">Walking, 12.5 mins per km, mod. pace</a></li>
+</ul></body></html>"""
+
+ENTRY_FORM = """<div id="loaded_item">
+<input type="hidden" value="0" name="exercise_entry[exercise_type]" id="exercise_entry_exercise_type" />
+<input name="authenticity_token" type="hidden" value="ENTRYTOKEN">
+<p class="exercise-description">Walking, 12.5 mins per km, mod. pace</p>
+<input type="hidden" id="mets" value="3.3">
+</div>"""
+
+
+@pytest.fixture
+def cardio_client(exercise_client, make_response):
+    session = exercise_client.session
+    session.route("GET", "exercise/add_to_diary", make_response(text=ADD_PAGE))
+    session.route("POST", "exercise/search", make_response(text=SEARCH_RESULTS))
+    session.route("GET", "exercise/update_exercise/", make_response(text=ENTRY_FORM))
+    session.route("POST", "exercise/add", make_response(status_code=200))
+    return exercise_client
+
+
+def test_search_cardio_reads_ids_from_result_links(cardio_client):
+    results = exercise.search_cardio(cardio_client, TODAY, "walking")
+    assert results[1] == {
+        "exercise_id": "26688321",
+        "name": "Walking, 12.5 mins per km, mod. pace",
+    }
+    _, url, kwargs = _posts(cardio_client)[0]
+    assert url.endswith("exercise/search")
+    assert kwargs["data"]["authenticity_token"] == "SEARCHTOKEN"
+
+
+def test_log_cardio_exact_name_posts_entry_with_mfp_calorie_formula(cardio_client):
+    result = exercise.log_cardio(
+        cardio_client, TODAY, 60, query="walking, 12.5 mins per km, mod. pace"
+    )
+    assert result["ok"] and result["calories"] == 330
+    _, url, kwargs = _posts(cardio_client)[-1]
+    assert url.endswith("exercise/add")
+    data = kwargs["data"]
+    assert data["authenticity_token"] == "ENTRYTOKEN"
+    assert data["exercise_entry[exercise_id]"] == "26688321"
+    assert data["exercise_entry[date]"] == "2026-09-10"
+    assert data["exercise_entry[quantity]"] == "60"
+
+
+def test_log_cardio_ambiguous_query_logs_nothing(cardio_client):
+    result = exercise.log_cardio(cardio_client, TODAY, 30, query="walking")
+    assert result["needs_choice"] and len(result["candidates"]) == 2
+    assert not any(url.endswith("exercise/add") for _, url, _ in _posts(cardio_client))
+
+
+def test_log_cardio_explicit_calories_skip_formula(cardio_client):
+    result = exercise.log_cardio(
+        cardio_client, TODAY, 30, exercise_id="196", calories=150
+    )
+    assert result["calories"] == 150
+    assert _posts(cardio_client)[-1][2]["data"]["exercise_entry[calories]"] == 150

@@ -3,7 +3,15 @@ from datetime import date
 from lxml import html as lh
 
 from .entry_matching import find_entries, no_matching_entry, resolve_entry
-from .mfp_web import get_page, post_legacy_delete, site_url
+from .mfp_web import (
+    form_token,
+    get_document,
+    get_page,
+    legacy_form_headers,
+    post_legacy_delete,
+    require_status,
+    site_url,
+)
 
 ALL_MATCHES_ADVICE = (
     "Use a more specific query to pick one, or pass all_matches=True to remove "
@@ -93,3 +101,138 @@ def delete_exercise(client, day: date, query: str, all_matches: bool = False) ->
     for entry in targets:
         remove_exercise_entry(client, entry["entry_id"], token)
     return {"day": day.isoformat(), "removed": targets, "count": len(targets)}
+
+
+def _add_page_url(client, day: date) -> str:
+    return site_url(
+        client,
+        "exercise/add_to_diary",
+        params={"date": day.isoformat(), "type": "cardio"},
+    )
+
+
+def _hidden_value(doc, element_id: str) -> str | None:
+    values = doc.xpath(f"//input[@id='{element_id}']/@value")
+    return values[0] if values else None
+
+
+def search_cardio(client, day: date, query: str) -> list[dict]:
+    """The legacy add page's search form; results link to the per-exercise
+    entry form, whose path carries the exercise id."""
+    add_url = _add_page_url(client, day)
+    doc, _ = get_page(client, add_url)
+    resp = client.session.post(
+        site_url(client, "exercise/search"),
+        data={
+            "authenticity_token": form_token(doc, "/exercise/search"),
+            "type": "cardio",
+            "date": day.isoformat(),
+            "search": query,
+        },
+        headers=legacy_form_headers(add_url),
+    )
+    require_status(resp, "/exercise/search", (200,))
+    results = []
+    for anchor in lh.fromstring(resp.text).xpath("//ul[@id='matching']//li/a"):
+        href = anchor.get("href", "")
+        if "/exercise/update_exercise/" not in href:
+            continue
+        results.append(
+            {
+                "exercise_id": href.split("?")[0].rstrip("/").split("/")[-1],
+                "name": anchor.text_content().strip(),
+            }
+        )
+    return results
+
+
+def _pick_exercise(results: list[dict], query: str) -> dict | None:
+    wanted = query.strip().lower()
+    exact = [r for r in results if r["name"].lower() == wanted]
+    if len(exact) == 1:
+        return exact[0]
+    if len(results) == 1:
+        return results[0]
+    return None
+
+
+def log_cardio(
+    client,
+    day: date,
+    minutes: float,
+    query: str | None = None,
+    exercise_id: str | None = None,
+    calories: int | None = None,
+) -> dict:
+    """Replicates the legacy add-cardio form. Without `calories`, burns are
+    computed the way the form's own JavaScript does: METs x hours x the
+    account's current weight in kg x the page's calorie multiplier."""
+    if minutes <= 0:
+        raise ValueError("minutes must be greater than zero")
+    if exercise_id is None:
+        if not query:
+            raise ValueError("pass a query or an exercise_id")
+        results = search_cardio(client, day, query)
+        if not results:
+            raise ValueError(f"no MyFitnessPal cardio exercise matches {query!r}")
+        picked = _pick_exercise(results, query)
+        if picked is None:
+            return {
+                "ok": False,
+                "needs_choice": True,
+                "query": query,
+                "candidates": results,
+                "next_step": (
+                    "Call again with exercise_id set to one candidate's id, "
+                    "or with query set to its exact name."
+                ),
+            }
+        exercise_id = picked["exercise_id"]
+
+    add_doc, _ = get_page(client, _add_page_url(client, day))
+    weight_kg = float(_hidden_value(add_doc, "current_weight") or 0)
+    multiplier = float(_hidden_value(add_doc, "calorie_multiplier") or 1.0)
+
+    entry_url = site_url(client, f"exercise/update_exercise/{exercise_id}", day)
+    form = get_document(client, entry_url)
+    token = form.xpath("//input[@name='authenticity_token']/@value")
+    if not token:
+        raise RuntimeError("couldn't read the MyFitnessPal exercise entry form")
+    names = form.xpath("//p[@class='exercise-description']/text()")
+    name = names[0].strip() if names else str(exercise_id)
+    exercise_type = _hidden_value(form, "exercise_entry_exercise_type") or "0"
+    if calories is None:
+        mets = float(_hidden_value(form, "mets") or 0)
+        if not mets or not weight_kg:
+            raise RuntimeError(
+                "MyFitnessPal didn't supply METs or weight; pass calories explicitly"
+            )
+        calories = round(mets * (minutes / 60) * weight_kg * multiplier)
+
+    resp = client.session.post(
+        site_url(client, "exercise/add"),
+        data={
+            "authenticity_token": token[0],
+            "calorie_multiplier": multiplier,
+            "exercise_entry[exercise_id]": exercise_id,
+            "exercise_entry[date]": day.isoformat(),
+            "exercise_entry[exercise_type]": exercise_type,
+            "exercise_entry[quantity]": f"{minutes:g}",
+            "exercise_entry[start_time(1i)]": day.year,
+            "exercise_entry[start_time(2i)]": day.month,
+            "exercise_entry[start_time(3i)]": day.day,
+            "exercise_entry[start_time(4i)]": "12",
+            "exercise_entry[start_time(5i)]": "00",
+            "exercise_entry[calories]": calories,
+        },
+        headers=legacy_form_headers(_add_page_url(client, day)),
+    )
+    require_status(resp, "/exercise/add", (200, 302))
+    return {
+        "ok": True,
+        "day": day.isoformat(),
+        "exercise_id": str(exercise_id),
+        "name": name,
+        "minutes": minutes,
+        "calories": calories,
+    }
