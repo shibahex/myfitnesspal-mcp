@@ -447,6 +447,45 @@ async def fitness_save_meal(
 
 
 @mcp.tool()
+async def fitness_create_meal(
+    name: str, items: list[dict], ctx: Context = None
+) -> dict:
+    """Create a named MyFitnessPal saved meal (My Meals) from foods, without
+    logging them to any of your days.
+
+    items: each food in the meal, one of
+      {"food_id": ..., "weight_id": ..., "quantity": 2} from fitness_search_food, or
+      {"food_id": ..., "serving": 0, "quantity": 1} for one of your custom foods
+      (fitness_list_my_foods; serving is the index of its serving size).
+    quantity is the number of servings. The meal is built in Snacks on
+    2001-01-01 and those entries are removed again, so that day must be empty.
+    To save foods already logged on a day, use fitness_save_meal. Every call
+    creates a new meal, so check fitness_list_my_foods first. Log it later with
+    fitness_log_my_food.
+    """
+
+    def op(store, client):
+        return my_foods.create_meal(client, name, items)
+
+    return {"ok": True, **await with_session(ctx, op)}
+
+
+@mcp.tool()
+async def fitness_delete_meal(food_id: str, ctx: Context = None) -> dict:
+    """Delete one of your MyFitnessPal saved meals (My Meals). It can't be
+    undone, so only when the user asks to delete that meal.
+
+    food_id: the meal's food_id from fitness_list_my_foods (kind "meal").
+    Foods already logged from it stay in the diary.
+    """
+
+    def op(store, client):
+        return my_foods.delete_meal(client, food_id)
+
+    return {"ok": True, **await with_session(ctx, op)}
+
+
+@mcp.tool()
 async def fitness_list_my_foods(search: str = "", ctx: Context = None) -> dict:
     """List your MyFitnessPal custom foods (kind "food") and saved meals
     (kind "meal"), optionally filtered by name.

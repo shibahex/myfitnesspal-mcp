@@ -12,6 +12,7 @@ from .mfp_web import (
     get_document,
     get_json,
     legacy_form_headers,
+    post_legacy_delete,
     require_status,
     site_url,
 )
@@ -307,6 +308,8 @@ def save_meal(client, day: date, meal: str, name: str) -> dict:
         data={
             "authenticity_token": form_token(form_doc, "/meal/create"),
             "meal_id": meal_position,
+            # The form's own field: without it MFP saves that meal from today.
+            "date": day.isoformat(),
             "meal[description]": name.strip(),
         },
         headers=legacy_form_headers(form_url),
@@ -320,3 +323,90 @@ def save_meal(client, day: date, meal: str, name: str) -> dict:
         "date": day.isoformat(),
         "meal": saved[-1] if saved else None,
     }
+
+
+# create_meal builds the meal in an empty diary meal on a day nobody logs on, since MFP only
+# saves meals from the diary ("Remember Meal"), then removes what it logged there.
+SCRATCH_DAY = date(2001, 1, 1)
+SCRATCH_MEAL = "snacks"
+
+
+def _scratch_entries(client, meal: str) -> tuple[list[dict], tuple]:
+    page = diary.diary_page(client, SCRATCH_DAY)
+    label = diary.normalize_meal(diary.resolve_meal(page[0], meal)[1])
+    return [e for e in diary.diary_entries(page[0]) if e["meal"] == label], page
+
+
+def create_meal(client, name: str, items: list[dict], meal: str = SCRATCH_MEAL) -> dict:
+    """Saves a new meal from foods without touching the user's own days.
+    Each item is a search result ({food_id, weight_id, quantity}) or one of
+    the user's custom foods ({food_id, serving, quantity})."""
+    if not name.strip():
+        raise ValueError("name can't be empty")
+    if not items:
+        raise ValueError("give the meal at least one food")
+    plan = []
+    for item in items:
+        food_id = str(item.get("food_id") or "").strip()
+        quantity = float(item.get("quantity") or 1)
+        if not food_id or quantity <= 0:
+            raise ValueError("each item needs a food_id and a quantity above zero")
+        if item.get("weight_id"):
+            plan.append(("search", food_id, str(item["weight_id"]), quantity))
+            continue
+        food, _ = resolve_mine(client, None, food_id)
+        if food["kind"] != FOOD:
+            raise ValueError(f"{food['name']!r} is a saved meal; add its foods instead")
+        plan.append(("mine", food, item.get("serving"), quantity))
+
+    before, page = _scratch_entries(client, meal)
+    if before:
+        raise DiaryLookupError(
+            f"{meal} on {SCRATCH_DAY.isoformat()} isn't empty, so the meal can't be "
+            "built there; clear it in MyFitnessPal first"
+        )
+    try:
+        for kind, food, extra, quantity in plan:
+            if kind == "search":
+                diary.push_food(
+                    client,
+                    SCRATCH_DAY,
+                    meal,
+                    food_id=food,
+                    weight_id=extra,
+                    quantity=quantity,
+                    page=page,
+                )
+            else:
+                log_mine(
+                    client, SCRATCH_DAY, meal, food, quantity=quantity, serving=extra
+                )
+        result = save_meal(client, SCRATCH_DAY, meal, name)
+    finally:
+        logged, page = _scratch_entries(client, meal)
+        for entry in logged:
+            post_legacy_delete(
+                client,
+                "food/remove",
+                entry["entry_id"],
+                page[1],
+                referer=diary.food_diary_url(client),
+            )
+    return {"saved": result["saved"], "meal": result["meal"]}
+
+
+def delete_meal(client, meal_id: str) -> dict:
+    """Deletes one of the user's saved meals (My Meals). MFP has no undo."""
+    meal_id = str(meal_id).strip()
+    meal = next((m for m in my_meals(client) if m["food_id"] == meal_id), None)
+    if meal is None:
+        raise NoMatchingFood(
+            f"{meal_id!r} isn't one of your saved meals; call fitness_list_my_foods "
+            "to see them"
+        )
+    resp = client.session.delete(
+        site_url(client, f"api/services/users/meals/delete/{meal_id}"),
+        headers=api_headers(client, {"Accept": "application/json"}),
+    )
+    require_status(resp, "/api/services/users/meals/delete", (200, 204))
+    return {"deleted": meal["name"], "food_id": meal_id}
